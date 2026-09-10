@@ -3,7 +3,7 @@ import requests
 import re
 import base64
 import urllib3
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urljoin, urlparse, parse_qs, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import os
@@ -314,9 +314,10 @@ def index():
 def url_proxy(real_url, referer):
     """
     Devuelve la URL proxificada a través de Cloudflare Worker.
-    El video YA NO pasa por Render, solo por Cloudflare.
+    Codifica la URL completa para que los ?token= no rompan la petición.
     """
-    return f"{CLOUDFLARE_WORKER_URL}/?url={real_url}"
+    url_encoded = quote(real_url, safe='')
+    return f"{CLOUDFLARE_WORKER_URL}/?url={url_encoded}"
 
 def generar_lista():
     print("=" * 60)
