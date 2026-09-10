@@ -22,7 +22,7 @@ MAX_DEPTH = 6
 REFERER_DEFECTO = BASE_URL + "/"
 
 # ⚠️ CAMBIA ESTO por la URL de tu Worker de Cloudflare
-CLOUDFLARE_WORKER_URL = "https://futbol-proxy.tu-usuario.workers.dev"
+CLOUDFLARE_WORKER_URL = "https://futbol-m3u.adritiktokmonetiza.workers.dev"
 
 # Calidad preferida: 1080, 720, 480 o None (máxima)
 CALIDAD_PREFERIDA = 720
