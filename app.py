@@ -7,6 +7,7 @@ from urllib.parse import urljoin, urlparse, parse_qs
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import os
+import threading
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -20,26 +21,35 @@ IMAGEN_PREDETERMINADA = IMG_BASE + "/uploads/sin_imagen_d36205f0e8.png"
 MAX_DEPTH = 6
 REFERER_DEFECTO = BASE_URL + "/"
 
-# 🔥 Calidad preferida: 1080, 720, 480 o None (para máxima disponible)
-#    En Render Free se recomienda 720 para evitar pausas
+# Calidad preferida: 1080, 720, 480 o None (máxima)
 CALIDAD_PREFERIDA = 720
 
-# 🔥 Verificación de canales
+# Verificación de canales
 VERIFICAR_CANALES = True
 HILOS_VERIFICACION = 5
 TIMEOUT_VERIFICACION = 12
 
-# 🔥 Caché
-CACHE_DURACION = 300  # segundos
+# Refresco en background
+REFRESCO_SEGUNDOS = 300   # regenerar cada 5 min
+REINTENTO_TRAS_ERROR = 30 # si falla, reintentar en 30s
 
 USER_AGENT = ("Mozilla/5.0 (Linux; Android 10; SM-G975F) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/91.0.4472.120 Mobile Safari/537.36")
 
-_cache = {"data": None, "timestamp": 0}
+# ============================================================
+#  CACHÉ GLOBAL + LOCK
+# ============================================================
+_cache = {
+    "data": "#EXTM3U\n# Generando lista, espera unos segundos y recarga...\n",
+    "timestamp": 0,
+    "generando": False,
+    "listo_alguna_vez": False,
+}
+_cache_lock = threading.Lock()
 
 # ============================================================
-#  SESIÓN GLOBAL CON POOLING (reutiliza conexiones)
+#  SESIONES CON POOLING
 # ============================================================
 _session_global = requests.Session()
 _session_global.headers.update({"User-Agent": USER_AGENT})
@@ -140,11 +150,6 @@ def buscar_iframes(texto, base_url):
     return list(dict.fromkeys(urls))
 
 def obtener_variante_maxima(url_m3u8, session, referer=None):
-    """
-    Descarga el m3u8 y devuelve la variante según CALIDAD_PREFERIDA.
-    Si CALIDAD_PREFERIDA es None, devuelve la de mayor bitrate.
-    Si no hay variante exacta, devuelve la más cercana por debajo.
-    """
     try:
         headers = {"Referer": referer, "User-Agent": USER_AGENT} if referer else {"User-Agent": USER_AGENT}
         r = session.get(url_m3u8, timeout=15, headers=headers, verify=False)
@@ -171,7 +176,6 @@ def obtener_variante_maxima(url_m3u8, session, referer=None):
         if not variantes:
             return url_m3u8, ""
 
-        # Filtrar por calidad preferida
         if CALIDAD_PREFERIDA:
             exactas = [v for v in variantes if v[1] == CALIDAD_PREFERIDA]
             if exactas:
@@ -180,7 +184,6 @@ def obtener_variante_maxima(url_m3u8, session, referer=None):
                 menores = [v for v in variantes if v[1] <= CALIDAD_PREFERIDA and v[1] > 0]
                 if menores:
                     variantes = menores
-                # Si todas son mayores, usa la menor de todas
                 else:
                     variantes.sort(key=lambda x: (x[0], x[1]))
                     variantes = [variantes[0]]
@@ -299,7 +302,11 @@ app = Flask(__name__)
 
 @app.route('/')
 def index():
-    return "Servidor activo. Ve a /lista.m3u"
+    with _cache_lock:
+        listo = _cache["listo_alguna_vez"]
+        generando = _cache["generando"]
+        ts = _cache["timestamp"]
+    return f"Servidor activo.<br>Listo: {listo}<br>Generando: {generando}<br>Última vez: {ts}"
 
 def url_proxy(real_url, referer):
     u = b64_encode(real_url)
@@ -308,7 +315,6 @@ def url_proxy(real_url, referer):
 
 @app.route('/p')
 def proxy():
-    """Proxy optimizado con pooling y streaming real."""
     u_b64 = request.args.get('u', '')
     r_b64 = request.args.get('r', '')
     real_url = b64_decode(u_b64)
@@ -325,7 +331,6 @@ def proxy():
         "Accept-Encoding": "identity",
     }
 
-    # Pasar Range si el cliente lo pide (importante para segmentos grandes)
     if request.headers.get("Range"):
         headers["Range"] = request.headers["Range"]
 
@@ -344,7 +349,6 @@ def proxy():
     es_m3u8 = ("mpegurl" in content_type) or (".m3u8" in real_url.lower())
 
     if es_m3u8:
-        # Reescribir URLs internas del playlist
         texto = r.text
         nuevas_lineas = []
         for linea in texto.splitlines():
@@ -360,10 +364,9 @@ def proxy():
             headers={"Access-Control-Allow-Origin": "*"}
         )
     else:
-        # 🔥 STREAMING REAL: enviar chunks conforme llegan
         def generar():
             try:
-                for chunk in r.iter_content(chunk_size=256 * 1024):  # 256 KB
+                for chunk in r.iter_content(chunk_size=256 * 1024):
                     if chunk:
                         yield chunk
             finally:
@@ -373,7 +376,6 @@ def proxy():
             "Access-Control-Allow-Origin": "*",
             "Cache-Control": "no-cache",
         }
-        # Propagar headers útiles si existen
         for h in ["Content-Range", "Accept-Ranges", "Content-Length"]:
             if h in r.headers:
                 resp_headers[h] = r.headers[h]
@@ -387,7 +389,7 @@ def proxy():
 
 def generar_lista():
     print("=" * 60)
-    print(f"🔄 Generando lista M3U (calidad preferida: {CALIDAD_PREFERIDA or 'máxima'})")
+    print(f"🔄 Generando lista M3U (calidad: {CALIDAD_PREFERIDA or 'máxima'})")
     print("=" * 60)
 
     session = requests.Session()
@@ -403,12 +405,11 @@ def generar_lista():
         datos = r.json()
     except Exception as e:
         print(f"❌ Error agenda: {e}")
-        return "#EXTM3U\n# Error al obtener agenda."
+        return None
 
     if not datos or "data" not in datos:
-        return "#EXTM3U\n# Sin datos"
+        return None
 
-    # ---------- 1. Extraer todos los embeds ----------
     embeds_a_probar = []
     for evento in datos["data"]:
         attrs = evento.get("attributes", {})
@@ -438,7 +439,6 @@ def generar_lista():
 
     print(f"📋 Total canales a probar: {len(embeds_a_probar)}")
 
-    # ---------- 2. Probar en paralelo ----------
     resultados = []
     with ThreadPoolExecutor(max_workers=HILOS_VERIFICACION) as executor:
         futuros = [executor.submit(probar_canal_completo, e, session) for e in embeds_a_probar]
@@ -450,7 +450,6 @@ def generar_lista():
             else:
                 print(f"   [{i}/{len(embeds_a_probar)}] ❌ {res['nombre']} → {res.get('razon','?')}")
 
-    # ---------- 3. Construir M3U ----------
     lineas = ["#EXTM3U"]
     ok_count = 0
     for res in resultados:
@@ -467,26 +466,103 @@ def generar_lista():
 
     return "\n".join(lineas) + "\n"
 
+# ============================================================
+#  BACKGROUND WORKER (genera la lista periódicamente)
+# ============================================================
+def worker_actualizacion():
+    """Corre en segundo plano, regenerando la lista cada X segundos."""
+    time.sleep(3)  # Esperar que Flask arranque
+
+    while True:
+        try:
+            with _cache_lock:
+                _cache["generando"] = True
+
+            print("▶️  [WORKER] Iniciando generación en background...")
+            inicio = time.time()
+            contenido = generar_lista()
+            duracion = time.time() - inicio
+
+            if contenido and len(contenido) > 50:
+                with _cache_lock:
+                    _cache["data"] = contenido
+                    _cache["timestamp"] = time.time()
+                    _cache["listo_alguna_vez"] = True
+                print(f"✅ [WORKER] Listo en {duracion:.1f}s. Próximo refresco en {REFRESCO_SEGUNDOS}s")
+                espera = REFRESCO_SEGUNDOS
+            else:
+                print(f"⚠️  [WORKER] Lista vacía o error. Reintento en {REINTENTO_TRAS_ERROR}s")
+                espera = REINTENTO_TRAS_ERROR
+
+        except Exception as e:
+            print(f"❌ [WORKER] Error: {e}")
+            espera = REINTENTO_TRAS_ERROR
+        finally:
+            with _cache_lock:
+                _cache["generando"] = False
+
+        time.sleep(espera)
+
+# ============================================================
+#  RUTAS
+# ============================================================
 @app.route('/lista.m3u')
 def servir_lista():
-    global _cache
-    ahora = time.time()
+    """Devuelve SIEMPRE la caché al instante (nunca bloquea)."""
+    with _cache_lock:
+        contenido = _cache["data"]
+        listo = _cache["listo_alguna_vez"]
 
-    if _cache["data"] and (ahora - _cache["timestamp"]) < CACHE_DURACION:
-        return Response(_cache["data"], mimetype='audio/x-mpegurl')
+    if not listo:
+        print("⏳ Primera petición, aún generando...")
 
-    contenido = generar_lista()
-    _cache["data"] = contenido
-    _cache["timestamp"] = ahora
-    return Response(contenido, mimetype='audio/x-mpegurl')
+    # Headers que ayudan a los reproductores IPTV
+    headers = {
+        "Content-Type": "application/x-mpegurl",
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+    return Response(contenido, status=200, headers=headers)
 
-# Endpoint opcional: forzar regeneración sin esperar caché
 @app.route('/refresh')
 def refresh():
-    global _cache
-    _cache["data"] = None
-    _cache["timestamp"] = 0
-    return "✅ Caché borrada. Pide /lista.m3u para regenerar."
+    """Fuerza un refresco inmediato en background."""
+    with _cache_lock:
+        ya_generando = _cache["generando"]
+
+    if ya_generando:
+        return "⏳ Ya se está generando, espera unos segundos."
+
+    # Disparar generación en un hilo aparte
+    def forzar():
+        with _cache_lock:
+            _cache["generando"] = True
+        try:
+            contenido = generar_lista()
+            if contenido and len(contenido) > 50:
+                with _cache_lock:
+                    _cache["data"] = contenido
+                    _cache["timestamp"] = time.time()
+                    _cache["listo_alguna_vez"] = True
+        finally:
+            with _cache_lock:
+                _cache["generando"] = False
+
+    threading.Thread(target=forzar, daemon=True).start()
+    return "🔄 Refresco lanzado. Espera 60s y recarga /lista.m3u"
+
+# ============================================================
+#  ARRANQUE
+# ============================================================
+def arrancar_worker():
+    hilo = threading.Thread(target=worker_actualizacion, daemon=True)
+    hilo.start()
+    print("🚀 Worker de actualización iniciado")
+
+# Arrancar el worker al importar el módulo (funciona con gunicorn)
+arrancar_worker()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
