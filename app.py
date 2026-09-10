@@ -467,18 +467,16 @@ def generar_lista():
     return "\n".join(lineas) + "\n"
 
 # ============================================================
-#  BACKGROUND WORKER (genera la lista periódicamente)
+#  BACKGROUND WORKER
 # ============================================================
 def worker_actualizacion():
-    """Corre en segundo plano, regenerando la lista cada X segundos."""
-    time.sleep(3)  # Esperar que Flask arranque
-
+    time.sleep(3)
     while True:
         try:
             with _cache_lock:
                 _cache["generando"] = True
 
-            print("▶️  [WORKER] Iniciando generación en background...")
+            print("▶️  [WORKER] Generando en background...")
             inicio = time.time()
             contenido = generar_lista()
             duracion = time.time() - inicio
@@ -488,10 +486,10 @@ def worker_actualizacion():
                     _cache["data"] = contenido
                     _cache["timestamp"] = time.time()
                     _cache["listo_alguna_vez"] = True
-                print(f"✅ [WORKER] Listo en {duracion:.1f}s. Próximo refresco en {REFRESCO_SEGUNDOS}s")
+                print(f"✅ [WORKER] Listo en {duracion:.1f}s. Próximo en {REFRESCO_SEGUNDOS}s")
                 espera = REFRESCO_SEGUNDOS
             else:
-                print(f"⚠️  [WORKER] Lista vacía o error. Reintento en {REINTENTO_TRAS_ERROR}s")
+                print(f"⚠️  [WORKER] Lista vacía. Reintento en {REINTENTO_TRAS_ERROR}s")
                 espera = REINTENTO_TRAS_ERROR
 
         except Exception as e:
@@ -504,11 +502,31 @@ def worker_actualizacion():
         time.sleep(espera)
 
 # ============================================================
+#  ARRANQUE LAZY DEL WORKER
+#  (evita que gunicorn mate el hilo al hacer fork)
+# ============================================================
+_worker_iniciado = False
+_worker_lock = threading.Lock()
+
+def iniciar_worker_si_necesario():
+    global _worker_iniciado
+    with _worker_lock:
+        if _worker_iniciado:
+            return
+        _worker_iniciado = True
+    hilo = threading.Thread(target=worker_actualizacion, daemon=True)
+    hilo.start()
+    print("🚀 Worker de actualización iniciado (lazy)")
+
+@app.before_request
+def _arrancar_worker():
+    iniciar_worker_si_necesario()
+
+# ============================================================
 #  RUTAS
 # ============================================================
 @app.route('/lista.m3u')
 def servir_lista():
-    """Devuelve SIEMPRE la caché al instante (nunca bloquea)."""
     with _cache_lock:
         contenido = _cache["data"]
         listo = _cache["listo_alguna_vez"]
@@ -516,7 +534,6 @@ def servir_lista():
     if not listo:
         print("⏳ Primera petición, aún generando...")
 
-    # Headers que ayudan a los reproductores IPTV
     headers = {
         "Content-Type": "application/x-mpegurl",
         "Access-Control-Allow-Origin": "*",
@@ -528,14 +545,12 @@ def servir_lista():
 
 @app.route('/refresh')
 def refresh():
-    """Fuerza un refresco inmediato en background."""
     with _cache_lock:
         ya_generando = _cache["generando"]
 
     if ya_generando:
         return "⏳ Ya se está generando, espera unos segundos."
 
-    # Disparar generación en un hilo aparte
     def forzar():
         with _cache_lock:
             _cache["generando"] = True
@@ -554,15 +569,8 @@ def refresh():
     return "🔄 Refresco lanzado. Espera 60s y recarga /lista.m3u"
 
 # ============================================================
-#  ARRANQUE
+#  MAIN
 # ============================================================
-def arrancar_worker():
-    hilo = threading.Thread(target=worker_actualizacion, daemon=True)
-    hilo.start()
-    print("🚀 Worker de actualización iniciado")
-
-# Arrancar el worker al importar el módulo (funciona con gunicorn)
-arrancar_worker()
-
 if __name__ == '__main__':
+    iniciar_worker_si_necesario()
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
