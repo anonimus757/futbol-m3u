@@ -1,41 +1,47 @@
-from flask import Flask, Response
+from flask import Flask, Response, request
 import requests
 import re
 import base64
 import urllib3
-import threading
-import time
 from urllib.parse import urljoin, urlparse, parse_qs
+import time
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ============================================================
-#  CONFIGURACIÓN
+#  CONFIG
 # ============================================================
 BASE_URL = "https://futbollibrevip.pe"
 AGENDA_URL = BASE_URL + "/agenda-data.php"
 IMG_BASE = "https://img.futbollibrehd.com.pe"
 IMAGEN_PREDETERMINADA = IMG_BASE + "/uploads/sin_imagen_d36205f0e8.png"
 MAX_DEPTH = 6
-USER_AGENT = "Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.120 Mobile Safari/537.36"
+REFERER_DEFECTO = BASE_URL + "/"
 
-CACHE_DURACION = 600  # 10 minutos
+USER_AGENT = ("Mozilla/5.0 (Linux; Android 10; SM-G975F) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/91.0.4472.120 Mobile Safari/537.36")
 
-# Caché global
-_cache = {
-    "data": "#EXTM3U\n# Generando lista, espera unos segundos y vuelve a cargar...\n",
-    "timestamp": 0,
-    "generando": False,
-    "lock": threading.Lock()
-}
+# Caché en memoria
+_cache = {"data": None, "timestamp": 0}
+CACHE_DURACION = 240  # 4 minutos (los tokens de ftlly duran ~5h)
 
 # ============================================================
-#  FUNCIONES DE SCRAPING
+#  HELPERS DE URL
 # ============================================================
-def limpiar_texto(texto):
-    if not texto:
+def b64_encode(s):
+    if not s:
         return ""
-    return re.sub(r'\s+', ' ', str(texto)).strip()
+    return base64.urlsafe_b64encode(s.encode()).decode().rstrip("=")
+
+def b64_decode(s):
+    if not s:
+        return ""
+    padding = "=" * (-len(s) % 4)
+    try:
+        return base64.urlsafe_b64decode(s + padding).decode()
+    except Exception:
+        return ""
 
 def adaptar_url(url, base=BASE_URL):
     if not url:
@@ -46,6 +52,11 @@ def adaptar_url(url, base=BASE_URL):
     if url.startswith("http"):
         return url
     return urljoin(base, url)
+
+def limpiar_texto(texto):
+    if not texto:
+        return ""
+    return re.sub(r'\s+', ' ', str(texto)).strip()
 
 def decodificar_param_r(url):
     try:
@@ -61,6 +72,9 @@ def decodificar_param_r(url):
         pass
     return None
 
+# ============================================================
+#  SCRAPING
+# ============================================================
 def buscar_m3u8(texto, base_url):
     encontrados = []
     patrones = [
@@ -138,14 +152,15 @@ def extraer_m3u8(url_pagina, session, profundidad=0, visitadas=None, referer=Non
         r = session.get(url_pagina, timeout=15, allow_redirects=True, headers=headers)
         if r.status_code != 200: return []
         html = r.text
-    except Exception: return []
-
+    except Exception:
+        return []
     encontrados = buscar_m3u8(html, url_pagina)
     if encontrados: return encontrados
-
     if profundidad < MAX_DEPTH:
         iframes = buscar_iframes(html, url_pagina)
-        iframes = [u for u in iframes if not any(x in u.lower() for x in ["doubleclick", "googleads", "googlesyndication", "popads", "acscdn", "trkr.ppof", "workers.dev/?", "facebook", "twitter"])]
+        iframes = [u for u in iframes if not any(x in u.lower() for x in
+                   ["doubleclick", "googleads", "googlesyndication", "popads",
+                    "acscdn", "trkr.ppof", "workers.dev/?", "facebook", "twitter"])]
         for ifr in iframes:
             if ifr in visitadas: continue
             sub = extraer_m3u8(ifr, session, profundidad + 1, visitadas, referer=url_pagina)
@@ -161,17 +176,84 @@ def obtener_agenda(session):
         print(f"Error agenda: {e}")
         return None
 
-def generar_lista_completa():
-    """Genera la lista M3U completa (puede tardar 1-2 min)."""
-    print("🔄 Generando lista completa...")
-    inicio = time.time()
+# ============================================================
+#  FLASK
+# ============================================================
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return "Servidor activo. Ve a /lista.m3u"
+
+def url_proxy(real_url, referer):
+    """Devuelve la URL proxificada para el reproductor."""
+    u = b64_encode(real_url)
+    r = b64_encode(referer or REFERER_DEFECTO)
+    return f"/p?u={u}&r={r}"
+
+@app.route('/p')
+def proxy():
+    """Proxy que reenvía m3u8 y segmentos añadiendo Referer/UA."""
+    u_b64 = request.args.get('u', '')
+    r_b64 = request.args.get('r', '')
+    real_url = b64_decode(u_b64)
+    referer = b64_decode(r_b64) or REFERER_DEFECTO
+
+    if not real_url:
+        return "Falta url", 400
+
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": referer,
+        "Origin": referer.rsplit('/', 1)[0] if '/' in referer else referer,
+        "Accept": "*/*",
+    }
+
+    try:
+        r = requests.get(real_url, headers=headers, timeout=20, verify=False, stream=True)
+    except Exception as e:
+        print(f"Proxy error: {e}")
+        return f"Error: {e}", 502
+
+    if r.status_code != 200:
+        return f"Upstream {r.status_code}", r.status_code
+
+    content_type = r.headers.get("Content-Type", "").lower()
+    es_m3u8 = ("mpegurl" in content_type) or (".m3u8" in real_url.lower())
+
+    if es_m3u8:
+        texto = r.text
+        nuevas_lineas = []
+        for linea in texto.splitlines():
+            l = linea.strip()
+            if not l or l.startswith("#"):
+                nuevas_lineas.append(linea)
+                continue
+            # Es una URL (variante o segmento)
+            absoluta = urljoin(real_url, l)
+            proxificada = url_proxy(absoluta, referer)
+            nuevas_lineas.append(proxificada)
+        return Response("\n".join(nuevas_lineas),
+                        mimetype='application/vnd.apple.mpegurl',
+                        headers={"Access-Control-Allow-Origin": "*"})
+    else:
+        # Segmento, key, etc. Pasarlo directo
+        return Response(
+            r.iter_content(chunk_size=64 * 1024),
+            content_type=r.headers.get("Content-Type", "application/octet-stream"),
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
+
+
+def generar_lista():
+    print("🔄 Generando lista M3U con proxy...")
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
     session.verify = False
 
     datos = obtener_agenda(session)
     if not datos or "data" not in datos:
-        return "#EXTM3U\n# Error al obtener agenda.\n"
+        return "#EXTM3U\n# Error al obtener agenda."
 
     lineas = ["#EXTM3U"]
     total = 0
@@ -183,7 +265,8 @@ def generar_lista_completa():
         try:
             ruta_img = attrs["country"]["data"]["attributes"]["image"]["data"]["attributes"]["url"]
             img_url = ruta_img if ruta_img.startswith("http") else IMG_BASE + ruta_img
-        except (KeyError, TypeError): pass
+        except (KeyError, TypeError):
+            pass
 
         for embed in attrs.get("embeds", {}).get("data", []):
             embed_attrs = embed.get("attributes", {})
@@ -197,65 +280,32 @@ def generar_lista_completa():
             if m3u8_list:
                 m3u8_final = obtener_variante_maxima(m3u8_list[0], session, referer=url_real)
                 titulo = limpiar_texto(f"{descripcion} - {nombre_canal}").replace('"', "'").replace(",", "·")
+                # 🔑 Aquí usamos el proxy: el reproductor pedirá a nuestro servidor
+                url_proxificada = url_proxy(m3u8_final, url_real)
                 lineas.append(f'#EXTINF:-1 tvg-logo="{img_url}", {titulo}')
-                lineas.append(m3u8_final)
+                lineas.append(f"https://futbol-m3u.onrender.com{url_proxificada}")
                 total += 1
+                print(f"   ✅ {nombre_canal}")
+            else:
+                print(f"   ❌ {nombre_canal}")
 
-    print(f"✅ Lista generada: {total} canales en {time.time() - inicio:.1f}s")
+    print(f"✅ Total canales: {total}")
     return "\n".join(lineas) + "\n"
 
 
-# ============================================================
-#  SERVIDOR FLASK CON CACHÉ
-# ============================================================
-app = Flask(__name__)
-
-def regenerar_cache():
-    """Regenera la caché en un hilo separado."""
-    with _cache["lock"]:
-        if _cache["generando"]:
-            return
-        _cache["generando"] = True
-    try:
-        contenido = generar_lista_completa()
-        _cache["data"] = contenido
-        _cache["timestamp"] = time.time()
-    except Exception as e:
-        print(f"❌ Error generando lista: {e}")
-    finally:
-        _cache["generando"] = False
-
-
-@app.route('/')
-def index():
-    return "Servidor activo. Ve a /lista.m3u"
-
 @app.route('/lista.m3u')
 def servir_lista():
+    global _cache
     ahora = time.time()
 
-    # Caso 1: caché fresca → responder al instante
-    if _cache["timestamp"] and (ahora - _cache["timestamp"]) < CACHE_DURACION:
+    if _cache["data"] and (ahora - _cache["timestamp"]) < CACHE_DURACION:
         return Response(_cache["data"], mimetype='audio/x-mpegurl')
 
-    # Caso 2: caché existe pero está vieja → responder vieja y regenerar en background
-    if _cache["timestamp"]:
-        threading.Thread(target=regenerar_cache, daemon=True).start()
-        return Response(_cache["data"], mimetype='audio/x-mpegurl')
+    contenido = generar_lista()
+    _cache["data"] = contenido
+    _cache["timestamp"] = ahora
+    return Response(contenido, mimetype='audio/x-mpegurl')
 
-    # Caso 3: nunca se ha generado → generar en background y responder "espera"
-    threading.Thread(target=regenerar_cache, daemon=True).start()
-    return Response(
-        _cache["data"],
-        mimetype='audio/x-mpegurl',
-        headers={"Refresh": "30"}
-    )
-
-@app.route('/forzar')
-def forzar():
-    """Fuerza regeneración. Útil para probar."""
-    threading.Thread(target=regenerar_cache, daemon=True).start()
-    return "Regenerando en segundo plano. Espera 1-2 min y ve a /lista.m3u"
 
 if __name__ == '__main__':
     import os
