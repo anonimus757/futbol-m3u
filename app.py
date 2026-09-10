@@ -3,7 +3,7 @@ import requests
 import re
 import base64
 import urllib3
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urljoin, urlparse, parse_qs, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import os
@@ -20,9 +20,6 @@ IMG_BASE = "https://img.futbollibrehd.com.pe"
 IMAGEN_PREDETERMINADA = IMG_BASE + "/uploads/sin_imagen_d36205f0e8.png"
 MAX_DEPTH = 6
 REFERER_DEFECTO = BASE_URL + "/"
-
-# ⚠️ URL de tu Worker de Cloudflare
-CLOUDFLARE_WORKER_URL = "https://futbol-m3u.adritiktokmonetiza.workers.dev"
 
 # Calidad preferida: 1080, 720, 480 o None (máxima)
 CALIDAD_PREFERIDA = 720
@@ -52,7 +49,7 @@ _cache = {
 _cache_lock = threading.Lock()
 
 # ============================================================
-#  SESIÓN GLOBAL
+#  SESIÓN GLOBAL (para el proxy)
 # ============================================================
 _session_global = requests.Session()
 _session_global.headers.update({"User-Agent": USER_AGENT})
@@ -312,17 +309,89 @@ def index():
     return f"Servidor activo.<br>Listo: {listo}<br>Generando: {generando}<br>Última vez: {ts}"
 
 def url_proxy(real_url, referer):
-    """
-    Envía el URL real (tvf90.com/hd.php?...) al Worker.
-    El Worker se encarga de generar el token Y de reproducir.
-    """
-    url_b64 = base64.urlsafe_b64encode(real_url.encode()).decode().rstrip("=")
-    return f"{CLOUDFLARE_WORKER_URL}/play?url={url_b64}"
+    """Genera la URL del proxy interno de Render."""
+    u = b64_encode(real_url)
+    r = b64_encode(referer or REFERER_DEFECTO)
+    return f"/p?u={u}&r={r}"
+
+@app.route('/p')
+def proxy():
+    """Proxy de Render: reenvía m3u8 y segmentos con Referer/UA correctos."""
+    u_b64 = request.args.get('u', '')
+    r_b64 = request.args.get('r', '')
+    real_url = b64_decode(u_b64)
+    referer = b64_decode(r_b64) or REFERER_DEFECTO
+
+    if not real_url:
+        return "Falta url", 400
+
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": referer,
+        "Origin": referer.rsplit('/', 1)[0] if '/' in referer else referer,
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",
+    }
+
+    if request.headers.get("Range"):
+        headers["Range"] = request.headers["Range"]
+
+    try:
+        r = _session_global.get(
+            real_url, headers=headers, timeout=30,
+            verify=False, stream=True
+        )
+    except Exception as e:
+        return f"Error: {e}", 502
+
+    if r.status_code not in (200, 206):
+        return f"Upstream {r.status_code}", r.status_code
+
+    content_type = r.headers.get("Content-Type", "").lower()
+    es_m3u8 = ("mpegurl" in content_type) or (".m3u8" in real_url.lower())
+
+    if es_m3u8:
+        texto = r.text
+        nuevas_lineas = []
+        for linea in texto.splitlines():
+            l = linea.strip()
+            if not l or l.startswith("#"):
+                nuevas_lineas.append(linea)
+                continue
+            absoluta = urljoin(real_url, l)
+            nuevas_lineas.append(url_proxy(absoluta, referer))
+        return Response(
+            "\n".join(nuevas_lineas),
+            mimetype='application/vnd.apple.mpegurl',
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
+    else:
+        def generar():
+            try:
+                for chunk in r.iter_content(chunk_size=256 * 1024):
+                    if chunk:
+                        yield chunk
+            finally:
+                r.close()
+
+        resp_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-cache",
+        }
+        for h in ["Content-Range", "Accept-Ranges", "Content-Length"]:
+            if h in r.headers:
+                resp_headers[h] = r.headers[h]
+
+        return Response(
+            stream_with_context(generar()),
+            status=r.status_code,
+            content_type=r.headers.get("Content-Type", "video/mp2t"),
+            headers=resp_headers
+        )
 
 def generar_lista():
     print("=" * 60)
     print(f"🔄 Generando lista M3U (calidad: {CALIDAD_PREFERIDA or 'máxima'})")
-    print(f"🎯 Worker: {CLOUDFLARE_WORKER_URL}")
     print("=" * 60)
 
     session = requests.Session()
@@ -388,10 +457,10 @@ def generar_lista():
     for res in resultados:
         if not res["ok"]: continue
         titulo = limpiar_texto(f"{res['descripcion']} - {res['nombre']}").replace('"', "'").replace(",", "·")
-        # 🔑 Enviamos url_real al Worker (no el m3u8 extraído)
-        prox = url_proxy(res["url_real"], res["referer"])
+        prox = url_proxy(res["m3u8"], res["referer"])
+        # 🔑 URL absoluta apuntando a Render
         lineas.append(f'#EXTINF:-1 tvg-logo="{res["img"]}", {titulo}')
-        lineas.append(prox)
+        lineas.append(f"https://futbol-m3u.onrender.com{prox}")
         ok_count += 1
 
     print("=" * 60)
