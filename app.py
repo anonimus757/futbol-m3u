@@ -4,6 +4,7 @@ import re
 import base64
 import urllib3
 from urllib.parse import urljoin, urlparse, parse_qs
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -18,25 +19,28 @@ IMAGEN_PREDETERMINADA = IMG_BASE + "/uploads/sin_imagen_d36205f0e8.png"
 MAX_DEPTH = 6
 REFERER_DEFECTO = BASE_URL + "/"
 
+# 🔥 Filtro de canales caídos
+VERIFICAR_CANALES = True       # True = solo agrega los que reproducen
+HILOS_VERIFICACION = 5         # canales probados en paralelo
+TIMEOUT_VERIFICACION = 12      # segundos por prueba
+
+CACHE_DURACION = 300           # 5 min de caché (la verificación tarda)
+
 USER_AGENT = ("Mozilla/5.0 (Linux; Android 10; SM-G975F) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/91.0.4472.120 Mobile Safari/537.36")
 
-# Caché en memoria
 _cache = {"data": None, "timestamp": 0}
-CACHE_DURACION = 240  # 4 minutos (los tokens de ftlly duran ~5h)
 
 # ============================================================
-#  HELPERS DE URL
+#  HELPERS BASE64
 # ============================================================
 def b64_encode(s):
-    if not s:
-        return ""
+    if not s: return ""
     return base64.urlsafe_b64encode(s.encode()).decode().rstrip("=")
 
 def b64_decode(s):
-    if not s:
-        return ""
+    if not s: return ""
     padding = "=" * (-len(s) % 4)
     try:
         return base64.urlsafe_b64decode(s + padding).decode()
@@ -44,18 +48,14 @@ def b64_decode(s):
         return ""
 
 def adaptar_url(url, base=BASE_URL):
-    if not url:
-        return None
+    if not url: return None
     url = url.strip()
-    if url.startswith("//"):
-        return "https:" + url
-    if url.startswith("http"):
-        return url
+    if url.startswith("//"): return "https:" + url
+    if url.startswith("http"): return url
     return urljoin(base, url)
 
 def limpiar_texto(texto):
-    if not texto:
-        return ""
+    if not texto: return ""
     return re.sub(r'\s+', ' ', str(texto)).strip()
 
 def decodificar_param_r(url):
@@ -66,10 +66,8 @@ def decodificar_param_r(url):
             b64 = qs["r"][0]
             padding = "=" * (-len(b64) % 4)
             decoded = base64.b64decode(b64 + padding).decode("utf-8", errors="ignore")
-            if decoded.startswith("http"):
-                return decoded
-    except Exception:
-        pass
+            if decoded.startswith("http"): return decoded
+    except Exception: pass
     return None
 
 # ============================================================
@@ -99,8 +97,7 @@ def buscar_m3u8(texto, base_url):
                 p = urlparse(url)
                 if "." not in p.netloc: continue
             except Exception: continue
-            if url not in encontrados:
-                encontrados.append(url)
+            if url not in encontrados: encontrados.append(url)
     return encontrados
 
 def buscar_iframes(texto, base_url):
@@ -119,11 +116,11 @@ def buscar_iframes(texto, base_url):
 
 def obtener_variante_maxima(url_m3u8, session, referer=None):
     try:
-        headers = {"Referer": referer} if referer else {}
-        r = session.get(url_m3u8, timeout=15, headers=headers)
-        if r.status_code != 200: return url_m3u8
+        headers = {"Referer": referer, "User-Agent": USER_AGENT} if referer else {"User-Agent": USER_AGENT}
+        r = session.get(url_m3u8, timeout=15, headers=headers, verify=False)
+        if r.status_code != 200: return url_m3u8, ""
         contenido = r.text
-        if "#EXT-X-STREAM-INF" not in contenido: return url_m3u8
+        if "#EXT-X-STREAM-INF" not in contenido: return url_m3u8, ""
         lineas = contenido.splitlines()
         variantes = []
         for i, linea in enumerate(lineas):
@@ -137,19 +134,21 @@ def obtener_variante_maxima(url_m3u8, session, referer=None):
                     if l and not l.startswith("#"):
                         variantes.append((bw, altura, adaptar_url(l, url_m3u8)))
                         break
-        if not variantes: return url_m3u8
+        if not variantes: return url_m3u8, ""
         variantes.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        return variantes[0][2]
+        bw, h, url = variantes[0]
+        calidad = f"{h}p" if h else f"{bw // 1000}kbps"
+        return url, calidad
     except Exception:
-        return url_m3u8
+        return url_m3u8, ""
 
 def extraer_m3u8(url_pagina, session, profundidad=0, visitadas=None, referer=None):
     if visitadas is None: visitadas = set()
     if profundidad > MAX_DEPTH or url_pagina in visitadas: return []
     visitadas.add(url_pagina)
     try:
-        headers = {"Referer": referer} if referer else {}
-        r = session.get(url_pagina, timeout=15, allow_redirects=True, headers=headers)
+        headers = {"Referer": referer, "User-Agent": USER_AGENT} if referer else {"User-Agent": USER_AGENT}
+        r = session.get(url_pagina, timeout=15, allow_redirects=True, headers=headers, verify=False)
         if r.status_code != 200: return []
         html = r.text
     except Exception:
@@ -167,14 +166,95 @@ def extraer_m3u8(url_pagina, session, profundidad=0, visitadas=None, referer=Non
             if sub: return sub
     return []
 
-def obtener_agenda(session):
+# ============================================================
+#  🔥 VERIFICACIÓN DE CANAL (la parte nueva)
+# ============================================================
+def verificar_canal(url_m3u8, referer):
+    """
+    Comprueba si el m3u8 realmente reproduce:
+    - Descarga el m3u8
+    - Si es master, obtiene la variante elegida
+    - Descarga el PRIMER segmento de video
+    - Devuelve True si obtiene bytes válidos
+    """
     try:
-        r = session.get(AGENDA_URL, timeout=15)
-        r.raise_for_status()
-        return r.json()
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Referer": referer or REFERER_DEFECTO,
+            "Origin": (referer or REFERER_DEFECTO).rsplit("/", 1)[0],
+            "Accept": "*/*",
+        }
+
+        # 1. Descargar el m3u8 (variante ya elegida)
+        r = requests.get(url_m3u8, headers=headers, timeout=TIMEOUT_VERIFICACION,
+                         verify=False, allow_redirects=True)
+        if r.status_code != 200:
+            return False, f"HTTP {r.status_code}"
+        texto = r.text
+        if "#EXTM3U" not in texto:
+            return False, "No es m3u8"
+
+        # 2. Buscar el primer segmento
+        primer_segmento = None
+        for linea in texto.splitlines():
+            l = linea.strip()
+            if l and not l.startswith("#"):
+                primer_segmento = adaptar_url(l, url_m3u8)
+                break
+
+        if not primer_segmento:
+            return False, "Sin segmentos"
+
+        # 3. Probar el segmento (pide solo el primer KB)
+        h2 = dict(headers)
+        h2["Range"] = "bytes=0-2048"
+        r2 = requests.get(primer_segmento, headers=h2, timeout=TIMEOUT_VERIFICACION,
+                          verify=False, stream=True, allow_redirects=True)
+
+        if r2.status_code not in (200, 206):
+            return False, f"Segmento HTTP {r2.status_code}"
+
+        # Leer un chunk pequeño
+        for chunk in r2.iter_content(chunk_size=1024):
+            if chunk:
+                r2.close()
+                return True, "OK"
+            break
+        r2.close()
+        return False, "Segmento vacío"
+
+    except requests.exceptions.Timeout:
+        return False, "Timeout"
     except Exception as e:
-        print(f"Error agenda: {e}")
-        return None
+        return False, type(e).__name__
+
+def probar_canal_completo(embed_info, session):
+    """
+    Dado un embed {nombre, url_real, url_embed, img, descripcion},
+    extrae el m3u8 y lo verifica.
+    Devuelve dict con resultado.
+    """
+    nombre_canal = embed_info["nombre"]
+    url_real = embed_info["url_real"]
+    url_embed = embed_info["url_embed"]
+
+    try:
+        m3u8_list = extraer_m3u8(url_real, session, referer=url_embed)
+        if not m3u8_list:
+            return {**embed_info, "ok": False, "razon": "Sin m3u8"}
+
+        m3u8_final, calidad = obtener_variante_maxima(m3u8_list[0], session, referer=url_real)
+
+        if VERIFICAR_CANALES:
+            ok, razon = verificar_canal(m3u8_final, referer=url_real)
+            if not ok:
+                return {**embed_info, "ok": False, "razon": razon}
+
+        return {**embed_info, "ok": True, "m3u8": m3u8_final,
+                "calidad": calidad, "referer": url_real}
+
+    except Exception as e:
+        return {**embed_info, "ok": False, "razon": type(e).__name__}
 
 # ============================================================
 #  FLASK
@@ -186,14 +266,12 @@ def index():
     return "Servidor activo. Ve a /lista.m3u"
 
 def url_proxy(real_url, referer):
-    """Devuelve la URL proxificada para el reproductor."""
     u = b64_encode(real_url)
     r = b64_encode(referer or REFERER_DEFECTO)
     return f"/p?u={u}&r={r}"
 
 @app.route('/p')
 def proxy():
-    """Proxy que reenvía m3u8 y segmentos añadiendo Referer/UA."""
     u_b64 = request.args.get('u', '')
     r_b64 = request.args.get('r', '')
     real_url = b64_decode(u_b64)
@@ -212,7 +290,6 @@ def proxy():
     try:
         r = requests.get(real_url, headers=headers, timeout=20, verify=False, stream=True)
     except Exception as e:
-        print(f"Proxy error: {e}")
         return f"Error: {e}", 502
 
     if r.status_code != 200:
@@ -229,15 +306,12 @@ def proxy():
             if not l or l.startswith("#"):
                 nuevas_lineas.append(linea)
                 continue
-            # Es una URL (variante o segmento)
             absoluta = urljoin(real_url, l)
-            proxificada = url_proxy(absoluta, referer)
-            nuevas_lineas.append(proxificada)
+            nuevas_lineas.append(url_proxy(absoluta, referer))
         return Response("\n".join(nuevas_lineas),
                         mimetype='application/vnd.apple.mpegurl',
                         headers={"Access-Control-Allow-Origin": "*"})
     else:
-        # Segmento, key, etc. Pasarlo directo
         return Response(
             r.iter_content(chunk_size=64 * 1024),
             content_type=r.headers.get("Content-Type", "application/octet-stream"),
@@ -246,17 +320,27 @@ def proxy():
 
 
 def generar_lista():
-    print("🔄 Generando lista M3U con proxy...")
+    print("=" * 60)
+    print("🔄 Generando lista M3U con verificación de canales...")
+    print("=" * 60)
+
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
     session.verify = False
 
-    datos = obtener_agenda(session)
-    if not datos or "data" not in datos:
+    try:
+        r = session.get(AGENDA_URL, timeout=15)
+        r.raise_for_status()
+        datos = r.json()
+    except Exception as e:
+        print(f"❌ Error agenda: {e}")
         return "#EXTM3U\n# Error al obtener agenda."
 
-    lineas = ["#EXTM3U"]
-    total = 0
+    if not datos or "data" not in datos:
+        return "#EXTM3U\n# Sin datos"
+
+    # ---------- 1. Extraer todos los embeds ----------
+    embeds_a_probar = []
     for evento in datos["data"]:
         attrs = evento.get("attributes", {})
         descripcion = limpiar_texto(attrs.get("diary_description", "Evento sin título"))
@@ -273,23 +357,45 @@ def generar_lista():
             nombre_canal = limpiar_texto(embed_attrs.get("embed_name", "Canal"))
             url_embed = adaptar_url(embed_attrs.get("embed_iframe", ""))
             if not url_embed: continue
-
             url_real = decodificar_param_r(url_embed) or url_embed
-            m3u8_list = extraer_m3u8(url_real, session, referer=url_embed)
 
-            if m3u8_list:
-                m3u8_final = obtener_variante_maxima(m3u8_list[0], session, referer=url_real)
-                titulo = limpiar_texto(f"{descripcion} - {nombre_canal}").replace('"', "'").replace(",", "·")
-                # 🔑 Aquí usamos el proxy: el reproductor pedirá a nuestro servidor
-                url_proxificada = url_proxy(m3u8_final, url_real)
-                lineas.append(f'#EXTINF:-1 tvg-logo="{img_url}", {titulo}')
-                lineas.append(f"https://futbol-m3u.onrender.com{url_proxificada}")
-                total += 1
-                print(f"   ✅ {nombre_canal}")
+            embeds_a_probar.append({
+                "nombre": nombre_canal,
+                "url_real": url_real,
+                "url_embed": url_embed,
+                "img": img_url,
+                "descripcion": descripcion,
+            })
+
+    print(f"📋 Total canales a probar: {len(embeds_a_probar)}")
+
+    # ---------- 2. Probar en paralelo ----------
+    resultados = []
+    with ThreadPoolExecutor(max_workers=HILOS_VERIFICACION) as executor:
+        futuros = [executor.submit(probar_canal_completo, e, session) for e in embeds_a_probar]
+        for i, fut in enumerate(as_completed(futuros), 1):
+            res = fut.result()
+            resultados.append(res)
+            if res["ok"]:
+                print(f"   [{i}/{len(embeds_a_probar)}] ✅ {res['nombre']} ({res.get('calidad','')})")
             else:
-                print(f"   ❌ {nombre_canal}")
+                print(f"   [{i}/{len(embeds_a_probar)}] ❌ {res['nombre']} → {res.get('razon','?')}")
 
-    print(f"✅ Total canales: {total}")
+    # ---------- 3. Construir M3U con los que pasaron ----------
+    lineas = ["#EXTM3U"]
+    ok_count = 0
+    for res in resultados:
+        if not res["ok"]: continue
+        titulo = limpiar_texto(f"{res['descripcion']} - {res['nombre']}").replace('"', "'").replace(",", "·")
+        prox = url_proxy(res["m3u8"], res["referer"])
+        lineas.append(f'#EXTINF:-1 tvg-logo="{res["img"]}", {titulo}')
+        lineas.append(f"https://futbol-m3u.onrender.com{prox}")
+        ok_count += 1
+
+    print("=" * 60)
+    print(f"✅ Canales funcionales: {ok_count} / {len(embeds_a_probar)}")
+    print("=" * 60)
+
     return "\n".join(lineas) + "\n"
 
 
