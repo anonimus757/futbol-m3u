@@ -3,7 +3,7 @@ import requests
 import re
 import base64
 import urllib3
-from urllib.parse import urljoin, urlparse, parse_qs, quote
+from urllib.parse import urljoin, urlparse, parse_qs
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import os
@@ -21,7 +21,7 @@ IMAGEN_PREDETERMINADA = IMG_BASE + "/uploads/sin_imagen_d36205f0e8.png"
 MAX_DEPTH = 6
 REFERER_DEFECTO = BASE_URL + "/"
 
-# ⚠️ CAMBIA ESTO por la URL de tu Worker de Cloudflare
+# ⚠️ URL de tu Worker de Cloudflare
 CLOUDFLARE_WORKER_URL = "https://futbol-m3u.adritiktokmonetiza.workers.dev"
 
 # Calidad preferida: 1080, 720, 480 o None (máxima)
@@ -313,16 +313,16 @@ def index():
 
 def url_proxy(real_url, referer):
     """
-    Devuelve la URL proxificada a través de Cloudflare Worker.
-    Codifica la URL completa para que los ?token= no rompan la petición.
+    Envía el URL real (tvf90.com/hd.php?...) al Worker.
+    El Worker se encarga de generar el token Y de reproducir.
     """
-    url_encoded = quote(real_url, safe='')
-    return f"{CLOUDFLARE_WORKER_URL}/?url={url_encoded}"
+    url_b64 = base64.urlsafe_b64encode(real_url.encode()).decode().rstrip("=")
+    return f"{CLOUDFLARE_WORKER_URL}/play?url={url_b64}"
 
 def generar_lista():
     print("=" * 60)
     print(f"🔄 Generando lista M3U (calidad: {CALIDAD_PREFERIDA or 'máxima'})")
-    print(f"🎯 Proxy: {CLOUDFLARE_WORKER_URL}")
+    print(f"🎯 Worker: {CLOUDFLARE_WORKER_URL}")
     print("=" * 60)
 
     session = requests.Session()
@@ -388,7 +388,8 @@ def generar_lista():
     for res in resultados:
         if not res["ok"]: continue
         titulo = limpiar_texto(f"{res['descripcion']} - {res['nombre']}").replace('"', "'").replace(",", "·")
-        prox = url_proxy(res["m3u8"], res["referer"])
+        # 🔑 Enviamos url_real al Worker (no el m3u8 extraído)
+        prox = url_proxy(res["url_real"], res["referer"])
         lineas.append(f'#EXTINF:-1 tvg-logo="{res["img"]}", {titulo}')
         lineas.append(prox)
         ok_count += 1
