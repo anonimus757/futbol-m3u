@@ -21,6 +21,9 @@ IMAGEN_PREDETERMINADA = IMG_BASE + "/uploads/sin_imagen_d36205f0e8.png"
 MAX_DEPTH = 6
 REFERER_DEFECTO = BASE_URL + "/"
 
+# ⚠️ CAMBIA ESTO por la URL de tu Worker de Cloudflare
+CLOUDFLARE_WORKER_URL = "https://futbol-proxy.tu-usuario.workers.dev"
+
 # Calidad preferida: 1080, 720, 480 o None (máxima)
 CALIDAD_PREFERIDA = 720
 
@@ -30,15 +33,15 @@ HILOS_VERIFICACION = 5
 TIMEOUT_VERIFICACION = 12
 
 # Refresco en background
-REFRESCO_SEGUNDOS = 300   # regenerar cada 5 min
-REINTENTO_TRAS_ERROR = 30 # si falla, reintentar en 30s
+REFRESCO_SEGUNDOS = 300
+REINTENTO_TRAS_ERROR = 30
 
 USER_AGENT = ("Mozilla/5.0 (Linux; Android 10; SM-G975F) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/91.0.4472.120 Mobile Safari/537.36")
 
 # ============================================================
-#  CACHÉ GLOBAL + LOCK
+#  CACHÉ GLOBAL
 # ============================================================
 _cache = {
     "data": "#EXTM3U\n# Generando lista, espera unos segundos y recarga...\n",
@@ -49,7 +52,7 @@ _cache = {
 _cache_lock = threading.Lock()
 
 # ============================================================
-#  SESIONES CON POOLING
+#  SESIÓN GLOBAL
 # ============================================================
 _session_global = requests.Session()
 _session_global.headers.update({"User-Agent": USER_AGENT})
@@ -62,7 +65,7 @@ _session_global.mount("http://", requests.adapters.HTTPAdapter(
 ))
 
 # ============================================================
-#  HELPERS BASE64
+#  HELPERS
 # ============================================================
 def b64_encode(s):
     if not s: return ""
@@ -309,87 +312,16 @@ def index():
     return f"Servidor activo.<br>Listo: {listo}<br>Generando: {generando}<br>Última vez: {ts}"
 
 def url_proxy(real_url, referer):
-    u = b64_encode(real_url)
-    r = b64_encode(referer or REFERER_DEFECTO)
-    return f"/p?u={u}&r={r}"
-
-@app.route('/p')
-def proxy():
-    u_b64 = request.args.get('u', '')
-    r_b64 = request.args.get('r', '')
-    real_url = b64_decode(u_b64)
-    referer = b64_decode(r_b64) or REFERER_DEFECTO
-
-    if not real_url:
-        return "Falta url", 400
-
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Referer": referer,
-        "Origin": referer.rsplit('/', 1)[0] if '/' in referer else referer,
-        "Accept": "*/*",
-        "Accept-Encoding": "identity",
-    }
-
-    if request.headers.get("Range"):
-        headers["Range"] = request.headers["Range"]
-
-    try:
-        r = _session_global.get(
-            real_url, headers=headers, timeout=30,
-            verify=False, stream=True
-        )
-    except Exception as e:
-        return f"Error: {e}", 502
-
-    if r.status_code not in (200, 206):
-        return f"Upstream {r.status_code}", r.status_code
-
-    content_type = r.headers.get("Content-Type", "").lower()
-    es_m3u8 = ("mpegurl" in content_type) or (".m3u8" in real_url.lower())
-
-    if es_m3u8:
-        texto = r.text
-        nuevas_lineas = []
-        for linea in texto.splitlines():
-            l = linea.strip()
-            if not l or l.startswith("#"):
-                nuevas_lineas.append(linea)
-                continue
-            absoluta = urljoin(real_url, l)
-            nuevas_lineas.append(url_proxy(absoluta, referer))
-        return Response(
-            "\n".join(nuevas_lineas),
-            mimetype='application/vnd.apple.mpegurl',
-            headers={"Access-Control-Allow-Origin": "*"}
-        )
-    else:
-        def generar():
-            try:
-                for chunk in r.iter_content(chunk_size=256 * 1024):
-                    if chunk:
-                        yield chunk
-            finally:
-                r.close()
-
-        resp_headers = {
-            "Access-Control-Allow-Origin": "*",
-            "Cache-Control": "no-cache",
-        }
-        for h in ["Content-Range", "Accept-Ranges", "Content-Length"]:
-            if h in r.headers:
-                resp_headers[h] = r.headers[h]
-
-        return Response(
-            stream_with_context(generar()),
-            status=r.status_code,
-            content_type=r.headers.get("Content-Type", "video/mp2t"),
-            headers=resp_headers
-        )
+    """
+    Devuelve la URL proxificada a través de Cloudflare Worker.
+    El video YA NO pasa por Render, solo por Cloudflare.
+    """
+    return f"{CLOUDFLARE_WORKER_URL}/?url={real_url}"
 
 def generar_lista():
     print("=" * 60)
     print(f"🔄 Generando lista M3U (calidad: {CALIDAD_PREFERIDA or 'máxima'})")
+    print(f"🎯 Proxy: {CLOUDFLARE_WORKER_URL}")
     print("=" * 60)
 
     session = requests.Session()
@@ -457,7 +389,7 @@ def generar_lista():
         titulo = limpiar_texto(f"{res['descripcion']} - {res['nombre']}").replace('"', "'").replace(",", "·")
         prox = url_proxy(res["m3u8"], res["referer"])
         lineas.append(f'#EXTINF:-1 tvg-logo="{res["img"]}", {titulo}')
-        lineas.append(f"https://futbol-m3u.onrender.com{prox}")
+        lineas.append(prox)
         ok_count += 1
 
     print("=" * 60)
@@ -467,7 +399,7 @@ def generar_lista():
     return "\n".join(lineas) + "\n"
 
 # ============================================================
-#  BACKGROUND WORKER
+#  WORKER DE FONDO
 # ============================================================
 def worker_actualizacion():
     time.sleep(3)
@@ -503,7 +435,6 @@ def worker_actualizacion():
 
 # ============================================================
 #  ARRANQUE LAZY DEL WORKER
-#  (evita que gunicorn mate el hilo al hacer fork)
 # ============================================================
 _worker_iniciado = False
 _worker_lock = threading.Lock()
