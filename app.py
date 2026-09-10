@@ -3,9 +3,10 @@ import requests
 import re
 import base64
 import urllib3
+import threading
+import time
 from urllib.parse import urljoin, urlparse, parse_qs
 
-# Silenciar warnings de SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ============================================================
@@ -18,8 +19,18 @@ IMAGEN_PREDETERMINADA = IMG_BASE + "/uploads/sin_imagen_d36205f0e8.png"
 MAX_DEPTH = 6
 USER_AGENT = "Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.120 Mobile Safari/537.36"
 
+CACHE_DURACION = 600  # 10 minutos
+
+# Caché global
+_cache = {
+    "data": "#EXTM3U\n# Generando lista, espera unos segundos y vuelve a cargar...\n",
+    "timestamp": 0,
+    "generando": False,
+    "lock": threading.Lock()
+}
+
 # ============================================================
-#  FUNCIONES DE SCRAPING (Tu lógica original)
+#  FUNCIONES DE SCRAPING
 # ============================================================
 def limpiar_texto(texto):
     if not texto:
@@ -99,7 +110,6 @@ def obtener_variante_maxima(url_m3u8, session, referer=None):
         if r.status_code != 200: return url_m3u8
         contenido = r.text
         if "#EXT-X-STREAM-INF" not in contenido: return url_m3u8
-        
         lineas = contenido.splitlines()
         variantes = []
         for i, linea in enumerate(lineas):
@@ -151,31 +161,24 @@ def obtener_agenda(session):
         print(f"Error agenda: {e}")
         return None
 
-# ============================================================
-#  SERVIDOR FLASK
-# ============================================================
-app = Flask(__name__)
-
-@app.route('/')
-def index():
-    return "Servidor activo. Ve a /lista.m3u"
-
-@app.route('/lista.m3u')
-def servir_lista():
-    print("Generando lista M3U...")
+def generar_lista_completa():
+    """Genera la lista M3U completa (puede tardar 1-2 min)."""
+    print("🔄 Generando lista completa...")
+    inicio = time.time()
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
     session.verify = False
 
     datos = obtener_agenda(session)
     if not datos or "data" not in datos:
-        return Response("#EXTM3U\n# Error al obtener agenda.", mimetype='audio/x-mpegurl')
+        return "#EXTM3U\n# Error al obtener agenda.\n"
 
     lineas = ["#EXTM3U"]
+    total = 0
     for evento in datos["data"]:
         attrs = evento.get("attributes", {})
         descripcion = limpiar_texto(attrs.get("diary_description", "Evento sin título"))
-        
+
         img_url = IMAGEN_PREDETERMINADA
         try:
             ruta_img = attrs["country"]["data"]["attributes"]["image"]["data"]["attributes"]["url"]
@@ -196,8 +199,64 @@ def servir_lista():
                 titulo = limpiar_texto(f"{descripcion} - {nombre_canal}").replace('"', "'").replace(",", "·")
                 lineas.append(f'#EXTINF:-1 tvg-logo="{img_url}", {titulo}')
                 lineas.append(m3u8_final)
-    
-    return Response("\n".join(lineas) + "\n", mimetype='audio/x-mpegurl')
+                total += 1
+
+    print(f"✅ Lista generada: {total} canales en {time.time() - inicio:.1f}s")
+    return "\n".join(lineas) + "\n"
+
+
+# ============================================================
+#  SERVIDOR FLASK CON CACHÉ
+# ============================================================
+app = Flask(__name__)
+
+def regenerar_cache():
+    """Regenera la caché en un hilo separado."""
+    with _cache["lock"]:
+        if _cache["generando"]:
+            return
+        _cache["generando"] = True
+    try:
+        contenido = generar_lista_completa()
+        _cache["data"] = contenido
+        _cache["timestamp"] = time.time()
+    except Exception as e:
+        print(f"❌ Error generando lista: {e}")
+    finally:
+        _cache["generando"] = False
+
+
+@app.route('/')
+def index():
+    return "Servidor activo. Ve a /lista.m3u"
+
+@app.route('/lista.m3u')
+def servir_lista():
+    ahora = time.time()
+
+    # Caso 1: caché fresca → responder al instante
+    if _cache["timestamp"] and (ahora - _cache["timestamp"]) < CACHE_DURACION:
+        return Response(_cache["data"], mimetype='audio/x-mpegurl')
+
+    # Caso 2: caché existe pero está vieja → responder vieja y regenerar en background
+    if _cache["timestamp"]:
+        threading.Thread(target=regenerar_cache, daemon=True).start()
+        return Response(_cache["data"], mimetype='audio/x-mpegurl')
+
+    # Caso 3: nunca se ha generado → generar en background y responder "espera"
+    threading.Thread(target=regenerar_cache, daemon=True).start()
+    return Response(
+        _cache["data"],
+        mimetype='audio/x-mpegurl',
+        headers={"Refresh": "30"}
+    )
+
+@app.route('/forzar')
+def forzar():
+    """Fuerza regeneración. Útil para probar."""
+    threading.Thread(target=regenerar_cache, daemon=True).start()
+    return "Regenerando en segundo plano. Espera 1-2 min y ve a /lista.m3u"
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
+    import os
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
