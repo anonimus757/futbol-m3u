@@ -1,4 +1,4 @@
-from flask import Flask, Response, request
+from flask import Flask, Response, request, stream_with_context
 import requests
 import re
 import base64
@@ -6,6 +6,7 @@ import urllib3
 from urllib.parse import urljoin, urlparse, parse_qs
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+import os
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -19,18 +20,36 @@ IMAGEN_PREDETERMINADA = IMG_BASE + "/uploads/sin_imagen_d36205f0e8.png"
 MAX_DEPTH = 6
 REFERER_DEFECTO = BASE_URL + "/"
 
-# 🔥 Filtro de canales caídos
-VERIFICAR_CANALES = True       # True = solo agrega los que reproducen
-HILOS_VERIFICACION = 5         # canales probados en paralelo
-TIMEOUT_VERIFICACION = 12      # segundos por prueba
+# 🔥 Calidad preferida: 1080, 720, 480 o None (para máxima disponible)
+#    En Render Free se recomienda 720 para evitar pausas
+CALIDAD_PREFERIDA = 720
 
-CACHE_DURACION = 300           # 5 min de caché (la verificación tarda)
+# 🔥 Verificación de canales
+VERIFICAR_CANALES = True
+HILOS_VERIFICACION = 5
+TIMEOUT_VERIFICACION = 12
+
+# 🔥 Caché
+CACHE_DURACION = 300  # segundos
 
 USER_AGENT = ("Mozilla/5.0 (Linux; Android 10; SM-G975F) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/91.0.4472.120 Mobile Safari/537.36")
 
 _cache = {"data": None, "timestamp": 0}
+
+# ============================================================
+#  SESIÓN GLOBAL CON POOLING (reutiliza conexiones)
+# ============================================================
+_session_global = requests.Session()
+_session_global.headers.update({"User-Agent": USER_AGENT})
+_session_global.verify = False
+_session_global.mount("https://", requests.adapters.HTTPAdapter(
+    pool_connections=20, pool_maxsize=20, max_retries=2
+))
+_session_global.mount("http://", requests.adapters.HTTPAdapter(
+    pool_connections=20, pool_maxsize=20, max_retries=2
+))
 
 # ============================================================
 #  HELPERS BASE64
@@ -67,7 +86,8 @@ def decodificar_param_r(url):
             padding = "=" * (-len(b64) % 4)
             decoded = base64.b64decode(b64 + padding).decode("utf-8", errors="ignore")
             if decoded.startswith("http"): return decoded
-    except Exception: pass
+    except Exception:
+        pass
     return None
 
 # ============================================================
@@ -92,12 +112,17 @@ def buscar_m3u8(texto, base_url):
             if any(c in match for c in [" ", "\n", "\t", "<", ">", "\\"]): continue
             url = adaptar_url(match, base_url)
             if not url or not url.startswith(("http://", "https://")) or ".m3u8" not in url: continue
-            if any(x in url.lower() for x in ["ejemplo", "example", "test", "dummy", "sample", ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg"]): continue
+            if any(x in url.lower() for x in [
+                "ejemplo", "example", "test", "dummy", "sample",
+                ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg"
+            ]): continue
             try:
                 p = urlparse(url)
                 if "." not in p.netloc: continue
-            except Exception: continue
-            if url not in encontrados: encontrados.append(url)
+            except Exception:
+                continue
+            if url not in encontrados:
+                encontrados.append(url)
     return encontrados
 
 def buscar_iframes(texto, base_url):
@@ -115,12 +140,20 @@ def buscar_iframes(texto, base_url):
     return list(dict.fromkeys(urls))
 
 def obtener_variante_maxima(url_m3u8, session, referer=None):
+    """
+    Descarga el m3u8 y devuelve la variante según CALIDAD_PREFERIDA.
+    Si CALIDAD_PREFERIDA es None, devuelve la de mayor bitrate.
+    Si no hay variante exacta, devuelve la más cercana por debajo.
+    """
     try:
         headers = {"Referer": referer, "User-Agent": USER_AGENT} if referer else {"User-Agent": USER_AGENT}
         r = session.get(url_m3u8, timeout=15, headers=headers, verify=False)
-        if r.status_code != 200: return url_m3u8, ""
+        if r.status_code != 200:
+            return url_m3u8, ""
         contenido = r.text
-        if "#EXT-X-STREAM-INF" not in contenido: return url_m3u8, ""
+        if "#EXT-X-STREAM-INF" not in contenido:
+            return url_m3u8, ""
+
         lineas = contenido.splitlines()
         variantes = []
         for i, linea in enumerate(lineas):
@@ -134,11 +167,29 @@ def obtener_variante_maxima(url_m3u8, session, referer=None):
                     if l and not l.startswith("#"):
                         variantes.append((bw, altura, adaptar_url(l, url_m3u8)))
                         break
-        if not variantes: return url_m3u8, ""
+
+        if not variantes:
+            return url_m3u8, ""
+
+        # Filtrar por calidad preferida
+        if CALIDAD_PREFERIDA:
+            exactas = [v for v in variantes if v[1] == CALIDAD_PREFERIDA]
+            if exactas:
+                variantes = exactas
+            else:
+                menores = [v for v in variantes if v[1] <= CALIDAD_PREFERIDA and v[1] > 0]
+                if menores:
+                    variantes = menores
+                # Si todas son mayores, usa la menor de todas
+                else:
+                    variantes.sort(key=lambda x: (x[0], x[1]))
+                    variantes = [variantes[0]]
+
         variantes.sort(key=lambda x: (x[0], x[1]), reverse=True)
         bw, h, url = variantes[0]
         calidad = f"{h}p" if h else f"{bw // 1000}kbps"
         return url, calidad
+
     except Exception:
         return url_m3u8, ""
 
@@ -157,9 +208,10 @@ def extraer_m3u8(url_pagina, session, profundidad=0, visitadas=None, referer=Non
     if encontrados: return encontrados
     if profundidad < MAX_DEPTH:
         iframes = buscar_iframes(html, url_pagina)
-        iframes = [u for u in iframes if not any(x in u.lower() for x in
-                   ["doubleclick", "googleads", "googlesyndication", "popads",
-                    "acscdn", "trkr.ppof", "workers.dev/?", "facebook", "twitter"])]
+        iframes = [u for u in iframes if not any(x in u.lower() for x in [
+            "doubleclick", "googleads", "googlesyndication", "popads",
+            "acscdn", "trkr.ppof", "workers.dev/?", "facebook", "twitter"
+        ])]
         for ifr in iframes:
             if ifr in visitadas: continue
             sub = extraer_m3u8(ifr, session, profundidad + 1, visitadas, referer=url_pagina)
@@ -167,16 +219,9 @@ def extraer_m3u8(url_pagina, session, profundidad=0, visitadas=None, referer=Non
     return []
 
 # ============================================================
-#  🔥 VERIFICACIÓN DE CANAL (la parte nueva)
+#  VERIFICACIÓN DE CANAL
 # ============================================================
 def verificar_canal(url_m3u8, referer):
-    """
-    Comprueba si el m3u8 realmente reproduce:
-    - Descarga el m3u8
-    - Si es master, obtiene la variante elegida
-    - Descarga el PRIMER segmento de video
-    - Devuelve True si obtiene bytes válidos
-    """
     try:
         headers = {
             "User-Agent": USER_AGENT,
@@ -185,7 +230,6 @@ def verificar_canal(url_m3u8, referer):
             "Accept": "*/*",
         }
 
-        # 1. Descargar el m3u8 (variante ya elegida)
         r = requests.get(url_m3u8, headers=headers, timeout=TIMEOUT_VERIFICACION,
                          verify=False, allow_redirects=True)
         if r.status_code != 200:
@@ -194,7 +238,6 @@ def verificar_canal(url_m3u8, referer):
         if "#EXTM3U" not in texto:
             return False, "No es m3u8"
 
-        # 2. Buscar el primer segmento
         primer_segmento = None
         for linea in texto.splitlines():
             l = linea.strip()
@@ -205,7 +248,6 @@ def verificar_canal(url_m3u8, referer):
         if not primer_segmento:
             return False, "Sin segmentos"
 
-        # 3. Probar el segmento (pide solo el primer KB)
         h2 = dict(headers)
         h2["Range"] = "bytes=0-2048"
         r2 = requests.get(primer_segmento, headers=h2, timeout=TIMEOUT_VERIFICACION,
@@ -214,7 +256,6 @@ def verificar_canal(url_m3u8, referer):
         if r2.status_code not in (200, 206):
             return False, f"Segmento HTTP {r2.status_code}"
 
-        # Leer un chunk pequeño
         for chunk in r2.iter_content(chunk_size=1024):
             if chunk:
                 r2.close()
@@ -229,11 +270,6 @@ def verificar_canal(url_m3u8, referer):
         return False, type(e).__name__
 
 def probar_canal_completo(embed_info, session):
-    """
-    Dado un embed {nombre, url_real, url_embed, img, descripcion},
-    extrae el m3u8 y lo verifica.
-    Devuelve dict con resultado.
-    """
     nombre_canal = embed_info["nombre"]
     url_real = embed_info["url_real"]
     url_embed = embed_info["url_embed"]
@@ -272,6 +308,7 @@ def url_proxy(real_url, referer):
 
 @app.route('/p')
 def proxy():
+    """Proxy optimizado con pooling y streaming real."""
     u_b64 = request.args.get('u', '')
     r_b64 = request.args.get('r', '')
     real_url = b64_decode(u_b64)
@@ -285,20 +322,29 @@ def proxy():
         "Referer": referer,
         "Origin": referer.rsplit('/', 1)[0] if '/' in referer else referer,
         "Accept": "*/*",
+        "Accept-Encoding": "identity",
     }
 
+    # Pasar Range si el cliente lo pide (importante para segmentos grandes)
+    if request.headers.get("Range"):
+        headers["Range"] = request.headers["Range"]
+
     try:
-        r = requests.get(real_url, headers=headers, timeout=20, verify=False, stream=True)
+        r = _session_global.get(
+            real_url, headers=headers, timeout=30,
+            verify=False, stream=True
+        )
     except Exception as e:
         return f"Error: {e}", 502
 
-    if r.status_code != 200:
+    if r.status_code not in (200, 206):
         return f"Upstream {r.status_code}", r.status_code
 
     content_type = r.headers.get("Content-Type", "").lower()
     es_m3u8 = ("mpegurl" in content_type) or (".m3u8" in real_url.lower())
 
     if es_m3u8:
+        # Reescribir URLs internas del playlist
         texto = r.text
         nuevas_lineas = []
         for linea in texto.splitlines():
@@ -308,25 +354,48 @@ def proxy():
                 continue
             absoluta = urljoin(real_url, l)
             nuevas_lineas.append(url_proxy(absoluta, referer))
-        return Response("\n".join(nuevas_lineas),
-                        mimetype='application/vnd.apple.mpegurl',
-                        headers={"Access-Control-Allow-Origin": "*"})
-    else:
         return Response(
-            r.iter_content(chunk_size=64 * 1024),
-            content_type=r.headers.get("Content-Type", "application/octet-stream"),
+            "\n".join(nuevas_lineas),
+            mimetype='application/vnd.apple.mpegurl',
             headers={"Access-Control-Allow-Origin": "*"}
         )
+    else:
+        # 🔥 STREAMING REAL: enviar chunks conforme llegan
+        def generar():
+            try:
+                for chunk in r.iter_content(chunk_size=256 * 1024):  # 256 KB
+                    if chunk:
+                        yield chunk
+            finally:
+                r.close()
 
+        resp_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-cache",
+        }
+        # Propagar headers útiles si existen
+        for h in ["Content-Range", "Accept-Ranges", "Content-Length"]:
+            if h in r.headers:
+                resp_headers[h] = r.headers[h]
+
+        return Response(
+            stream_with_context(generar()),
+            status=r.status_code,
+            content_type=r.headers.get("Content-Type", "video/mp2t"),
+            headers=resp_headers
+        )
 
 def generar_lista():
     print("=" * 60)
-    print("🔄 Generando lista M3U con verificación de canales...")
+    print(f"🔄 Generando lista M3U (calidad preferida: {CALIDAD_PREFERIDA or 'máxima'})")
     print("=" * 60)
 
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
     session.verify = False
+    session.mount("https://", requests.adapters.HTTPAdapter(
+        pool_connections=10, pool_maxsize=10, max_retries=2
+    ))
 
     try:
         r = session.get(AGENDA_URL, timeout=15)
@@ -381,7 +450,7 @@ def generar_lista():
             else:
                 print(f"   [{i}/{len(embeds_a_probar)}] ❌ {res['nombre']} → {res.get('razon','?')}")
 
-    # ---------- 3. Construir M3U con los que pasaron ----------
+    # ---------- 3. Construir M3U ----------
     lineas = ["#EXTM3U"]
     ok_count = 0
     for res in resultados:
@@ -398,7 +467,6 @@ def generar_lista():
 
     return "\n".join(lineas) + "\n"
 
-
 @app.route('/lista.m3u')
 def servir_lista():
     global _cache
@@ -412,7 +480,13 @@ def servir_lista():
     _cache["timestamp"] = ahora
     return Response(contenido, mimetype='audio/x-mpegurl')
 
+# Endpoint opcional: forzar regeneración sin esperar caché
+@app.route('/refresh')
+def refresh():
+    global _cache
+    _cache["data"] = None
+    _cache["timestamp"] = 0
+    return "✅ Caché borrada. Pide /lista.m3u para regenerar."
 
 if __name__ == '__main__':
-    import os
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
